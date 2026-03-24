@@ -1,229 +1,314 @@
 const express = require('express');
 const cors = require('cors');
-const multer = require('multer');
+const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
-const { v4: uuidv4 } = require('uuid');
+const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 const execFileAsync = promisify(execFile);
 const app = express();
 const PORT = process.env.PORT || 3001;
+const TEMP = '/tmp/osvasa';
 
-// Temp directory for processing
-const TEMP_DIR = '/tmp/osvasa-video';
-if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
-
-// Middleware
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '10mb' }));
 
-// Multer for file uploads
-const storage = multer.diskStorage({
-  destination: TEMP_DIR,
-  filename: (req, file, cb) => cb(null, `${uuidv4()}-${file.originalname}`),
-});
-const upload = multer({ storage, limits: { fileSize: 50 * 1024 * 1024 } });
+// Ensure temp dir exists
+if (!fs.existsSync(TEMP)) fs.mkdirSync(TEMP, { recursive: true });
 
-// Health check
+// ── Helpers ──
+
+async function download(url, destPath) {
+  const res = await axios.get(url, { responseType: 'arraybuffer', timeout: 120000 });
+  fs.writeFileSync(destPath, Buffer.from(res.data));
+  console.log(`  Downloaded: ${path.basename(destPath)} (${(res.data.byteLength / 1024 / 1024).toFixed(1)}MB)`);
+}
+
+async function ffprobe(filePath, entry) {
+  const { stdout } = await execFileAsync('ffprobe', [
+    '-v', 'quiet', '-show_entries', entry,
+    '-of', 'default=noprint_wrappers=1:nokey=1', filePath,
+  ]);
+  return stdout.trim();
+}
+
+function cleanup(files) {
+  for (const f of files) {
+    try { fs.unlinkSync(f); } catch {}
+  }
+}
+
+// ── Core pipeline ──
+
+async function generateVideo({ clipUrls, musicUrl, textOverlays = [], outputFilename }) {
+  const jobId = uuidv4().slice(0, 8);
+  const jobDir = path.join(TEMP, jobId);
+  fs.mkdirSync(jobDir, { recursive: true });
+  const tempFiles = [];
+
+  try {
+    console.log(`[${jobId}] Starting pipeline: ${clipUrls.length} clips`);
+
+    // ── 1. Download all clips ──
+    console.log(`[${jobId}] Step 1: Downloading clips...`);
+    const rawClipPaths = [];
+    for (let i = 0; i < clipUrls.length; i++) {
+      const p = path.join(jobDir, `raw-${i}.mp4`);
+      await download(clipUrls[i], p);
+      rawClipPaths.push(p);
+      tempFiles.push(p);
+    }
+
+    // ── 2. Download music ──
+    let musicPath = null;
+    if (musicUrl) {
+      console.log(`[${jobId}] Step 2: Downloading music...`);
+      musicPath = path.join(jobDir, 'music.mp3');
+      await download(musicUrl, musicPath);
+      tempFiles.push(musicPath);
+    }
+
+    // ── 3. Process each clip: trim, scale 9:16, Ken Burns zoom ──
+    console.log(`[${jobId}] Step 3: Processing clips (trim, scale, Ken Burns)...`);
+    const processedPaths = [];
+    for (let i = 0; i < rawClipPaths.length; i++) {
+      const outPath = path.join(jobDir, `proc-${i}.mp4`);
+      // Ken Burns: zoom from 1.05x down to 1.0x over clip duration
+      // scale to cover 1080x1920, crop center
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-i', rawClipPaths[i],
+        '-t', '2.5',
+        '-filter_complex', [
+          // Scale to cover 1080x1920 maintaining aspect ratio then crop center
+          'scale=w=max(1080\\,ih*1080/iw):h=max(1920\\,iw*1920/ih):force_original_aspect_ratio=increase',
+          'crop=1080:1920',
+          // Ken Burns: subtle zoom from 1.05 to 1.0
+          "zoompan=z='1.05-0.05*on/25':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30",
+          'setsar=1',
+          'fps=30',
+        ].join(','),
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '20',
+        '-an',
+        '-t', '2.5',
+        outPath,
+      ], { maxBuffer: 200 * 1024 * 1024 });
+
+      processedPaths.push(outPath);
+      tempFiles.push(outPath);
+      console.log(`  Clip ${i + 1}/${rawClipPaths.length} processed`);
+    }
+
+    // ── 4. Concatenate clips ──
+    console.log(`[${jobId}] Step 4: Concatenating clips...`);
+    const concatListPath = path.join(jobDir, 'concat.txt');
+    fs.writeFileSync(concatListPath, processedPaths.map(p => `file '${p}'`).join('\n'));
+    tempFiles.push(concatListPath);
+
+    const concatPath = path.join(jobDir, 'concat.mp4');
+    tempFiles.push(concatPath);
+
+    await execFileAsync('ffmpeg', [
+      '-y', '-f', 'concat', '-safe', '0',
+      '-i', concatListPath,
+      '-c:v', 'libx264', '-preset', 'medium', '-crf', '20',
+      '-an',
+      '-movflags', '+faststart',
+      concatPath,
+    ], { maxBuffer: 200 * 1024 * 1024 });
+
+    // Get total video duration
+    const totalDuration = parseFloat(await ffprobe(concatPath, 'format=duration'));
+    console.log(`  Concatenated: ${totalDuration.toFixed(1)}s`);
+
+    // ── 5. Add music track ──
+    let withMusicPath = concatPath;
+    if (musicPath) {
+      console.log(`[${jobId}] Step 5: Adding music (volume 0.85, looped)...`);
+      withMusicPath = path.join(jobDir, 'with-music.mp4');
+      tempFiles.push(withMusicPath);
+
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-i', concatPath,
+        '-stream_loop', '-1', '-i', musicPath,
+        '-filter_complex', '[1:a]volume=0.85[bg];[bg]atrim=0:' + totalDuration.toFixed(2) + '[a]',
+        '-map', '0:v', '-map', '[a]',
+        '-c:v', 'copy',
+        '-c:a', 'aac', '-b:a', '128k',
+        '-shortest',
+        '-movflags', '+faststart',
+        withMusicPath,
+      ], { maxBuffer: 200 * 1024 * 1024 });
+      console.log('  Music added');
+    }
+
+    // ── 6. Add text overlays ──
+    let finalInputPath = withMusicPath;
+    if (textOverlays.length > 0) {
+      console.log(`[${jobId}] Step 6: Adding ${textOverlays.length} text overlays...`);
+      const overlayPath = path.join(jobDir, 'with-text.mp4');
+      tempFiles.push(overlayPath);
+
+      // Each overlay shows for 4 seconds, evenly spaced
+      const overlayDuration = 4;
+      const spacing = totalDuration / textOverlays.length;
+
+      // Build drawtext filters
+      const drawFilters = textOverlays.map((text, i) => {
+        const startTime = i * spacing;
+        const endTime = startTime + overlayDuration;
+        // Escape special characters for ffmpeg drawtext
+        const escaped = text
+          .replace(/\\/g, '\\\\\\\\')
+          .replace(/'/g, "'\\\\\\''")
+          .replace(/:/g, '\\:')
+          .replace(/%/g, '%%');
+
+        return `drawtext=text='${escaped}':fontsize=72:fontcolor=white:shadowcolor=black:shadowx=3:shadowy=3:x=(w-text_w)/2:y=h*0.85-text_h/2:enable='between(t,${startTime.toFixed(2)},${endTime.toFixed(2)})'`;
+      }).join(',');
+
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-i', finalInputPath,
+        '-vf', drawFilters,
+        '-c:v', 'libx264', '-preset', 'medium', '-crf', '20',
+        '-c:a', 'copy',
+        '-movflags', '+faststart',
+        overlayPath,
+      ], { maxBuffer: 200 * 1024 * 1024 });
+
+      finalInputPath = overlayPath;
+      console.log('  Text overlays added');
+    }
+
+    // ── 7. Final export at 1080x1920, 30fps, h264 ──
+    const fname = (outputFilename || `osvasa-${jobId}`).replace(/\.mp4$/, '');
+    const finalPath = path.join(jobDir, `${fname}.mp4`);
+    tempFiles.push(finalPath);
+
+    // Re-encode to ensure consistent output
+    console.log(`[${jobId}] Step 7: Final export...`);
+    await execFileAsync('ffmpeg', [
+      '-y',
+      '-i', finalInputPath,
+      '-c:v', 'libx264', '-preset', 'medium', '-crf', '18',
+      '-r', '30',
+      '-s', '1080x1920',
+      '-c:a', 'aac', '-b:a', '192k',
+      '-movflags', '+faststart',
+      finalPath,
+    ], { maxBuffer: 200 * 1024 * 1024 });
+
+    const stat = fs.statSync(finalPath);
+    console.log(`[${jobId}] Done: ${fname}.mp4 (${(stat.size / 1024 / 1024).toFixed(1)}MB)`);
+
+    return { finalPath, jobDir, tempFiles, fname };
+
+  } catch (err) {
+    // Cleanup on error
+    try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch {}
+    throw err;
+  }
+}
+
+// ── Routes ──
+
 app.get('/health', async (req, res) => {
   try {
     const { stdout } = await execFileAsync('ffmpeg', ['-version']);
-    const version = stdout.split('\n')[0];
-    res.json({ status: 'ok', ffmpeg: version });
-  } catch (err) {
+    res.json({ status: 'ok', ffmpeg: stdout.split('\n')[0] });
+  } catch {
     res.status(500).json({ status: 'error', error: 'ffmpeg not found' });
   }
 });
 
-// ── POST /generate-video ──
-// Accepts: video clips (as URLs or files), audio file/URL
-// Returns: merged video with audio as a downloadable file or URL
-app.post('/generate-video', upload.fields([
-  { name: 'clips', maxCount: 20 },
-  { name: 'audio', maxCount: 1 },
-]), async (req, res) => {
-  const jobId = uuidv4();
-  const jobDir = path.join(TEMP_DIR, jobId);
-  fs.mkdirSync(jobDir, { recursive: true });
+// Stream final video back as download
+app.post('/generate-video', async (req, res) => {
+  const { clipUrls, musicUrl, textOverlays, outputFilename } = req.body;
+
+  if (!clipUrls || !Array.isArray(clipUrls) || clipUrls.length === 0) {
+    return res.status(400).json({ error: 'clipUrls array required' });
+  }
 
   try {
-    const { clip_urls, audio_url } = req.body;
-    const clipFiles = req.files?.clips || [];
-    const audioFiles = req.files?.audio || [];
-
-    // Collect clip paths — from uploaded files or download from URLs
-    const clipPaths = [];
-
-    // Handle uploaded clip files
-    for (const file of clipFiles) {
-      clipPaths.push(file.path);
-    }
-
-    // Handle clip URLs — download them
-    if (clip_urls) {
-      const urls = Array.isArray(clip_urls) ? clip_urls : JSON.parse(clip_urls);
-      for (let i = 0; i < urls.length; i++) {
-        const clipPath = path.join(jobDir, `clip-${i}.mp4`);
-        await downloadFile(urls[i], clipPath);
-        clipPaths.push(clipPath);
-      }
-    }
-
-    if (clipPaths.length === 0) {
-      return res.status(400).json({ error: 'No video clips provided' });
-    }
-
-    // Get audio path — from upload or URL
-    let audioPath = null;
-    if (audioFiles.length > 0) {
-      audioPath = audioFiles[0].path;
-    } else if (audio_url) {
-      audioPath = path.join(jobDir, 'audio.mp3');
-      await downloadFile(audio_url, audioPath);
-    }
-
-    console.log(`[${jobId}] Processing ${clipPaths.length} clips, audio: ${!!audioPath}`);
-
-    // Step 1: Concatenate clips
-    const concatListPath = path.join(jobDir, 'concat.txt');
-    const concatContent = clipPaths.map(p => `file '${p}'`).join('\n');
-    fs.writeFileSync(concatListPath, concatContent);
-
-    const mergedPath = path.join(jobDir, 'merged.mp4');
-
-    if (clipPaths.length === 1) {
-      fs.copyFileSync(clipPaths[0], mergedPath);
-    } else {
-      await execFileAsync('ffmpeg', [
-        '-y', '-f', 'concat', '-safe', '0',
-        '-i', concatListPath,
-        '-c', 'copy',
-        mergedPath,
-      ], { maxBuffer: 100 * 1024 * 1024 });
-    }
-    console.log(`[${jobId}] Clips merged`);
-
-    // Step 2: Add audio if provided
-    const finalPath = path.join(jobDir, 'final.mp4');
-
-    if (audioPath) {
-      await execFileAsync('ffmpeg', [
-        '-y',
-        '-i', mergedPath,
-        '-i', audioPath,
-        '-c:v', 'copy',
-        '-c:a', 'aac', '-b:a', '128k',
-        '-map', '0:v:0', '-map', '1:a:0',
-        '-shortest',
-        '-movflags', '+faststart',
-        finalPath,
-      ], { maxBuffer: 100 * 1024 * 1024 });
-      console.log(`[${jobId}] Audio added`);
-    } else {
-      fs.copyFileSync(mergedPath, finalPath);
-    }
-
-    // Return the final video
-    const stat = fs.statSync(finalPath);
-    console.log(`[${jobId}] Final video: ${(stat.size / 1024 / 1024).toFixed(1)}MB`);
+    const { finalPath, jobDir, fname } = await generateVideo({
+      clipUrls, musicUrl, textOverlays, outputFilename,
+    });
 
     res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="osvasa-${jobId}.mp4"`);
-    res.setHeader('Content-Length', stat.size);
+    res.setHeader('Content-Disposition', `attachment; filename="${fname}.mp4"`);
+    res.setHeader('Content-Length', fs.statSync(finalPath).size);
 
     const stream = fs.createReadStream(finalPath);
     stream.pipe(res);
-    stream.on('end', () => cleanup(jobDir, clipPaths, audioPath));
-    stream.on('error', () => cleanup(jobDir, clipPaths, audioPath));
-
+    stream.on('close', () => {
+      try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch {}
+    });
   } catch (err) {
-    console.error(`[${jobId}] Error:`, err.message);
-    cleanup(jobDir);
+    console.error('generate-video error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ── POST /merge-audio ──
-// Mix two audio files (voiceover + music at lower volume)
-app.post('/merge-audio', upload.fields([
-  { name: 'voiceover', maxCount: 1 },
-  { name: 'music', maxCount: 1 },
-]), async (req, res) => {
-  const jobId = uuidv4();
-  const jobDir = path.join(TEMP_DIR, jobId);
-  fs.mkdirSync(jobDir, { recursive: true });
+// Upload final video to R2 and return public URL
+app.post('/generate-video-url', async (req, res) => {
+  const {
+    clipUrls, musicUrl, textOverlays, outputFilename,
+    r2Endpoint, r2AccessKey, r2SecretKey, r2Bucket, r2PublicUrl,
+  } = req.body;
 
+  if (!clipUrls || !Array.isArray(clipUrls) || clipUrls.length === 0) {
+    return res.status(400).json({ error: 'clipUrls array required' });
+  }
+  if (!r2Endpoint || !r2AccessKey || !r2SecretKey || !r2Bucket || !r2PublicUrl) {
+    return res.status(400).json({ error: 'R2 credentials required: r2Endpoint, r2AccessKey, r2SecretKey, r2Bucket, r2PublicUrl' });
+  }
+
+  let jobDir;
   try {
-    const { voiceover_url, music_url, music_volume = '0.2' } = req.body;
-    const voiceoverFiles = req.files?.voiceover || [];
-    const musicFiles = req.files?.music || [];
+    const result = await generateVideo({
+      clipUrls, musicUrl, textOverlays, outputFilename,
+    });
+    jobDir = result.jobDir;
 
-    let voiceoverPath = voiceoverFiles[0]?.path;
-    let musicPath = musicFiles[0]?.path;
+    // Upload to R2
+    console.log(`Uploading to R2...`);
+    const r2 = new S3Client({
+      region: 'auto',
+      endpoint: r2Endpoint,
+      credentials: { accessKeyId: r2AccessKey, secretAccessKey: r2SecretKey },
+    });
 
-    if (!voiceoverPath && voiceover_url) {
-      voiceoverPath = path.join(jobDir, 'voiceover.mp3');
-      await downloadFile(voiceover_url, voiceoverPath);
-    }
-    if (!musicPath && music_url) {
-      musicPath = path.join(jobDir, 'music.mp3');
-      await downloadFile(music_url, musicPath);
-    }
+    const videoKey = `videos/${result.fname}.mp4`;
+    const videoBuffer = fs.readFileSync(result.finalPath);
 
-    if (!voiceoverPath) {
-      return res.status(400).json({ error: 'No voiceover provided' });
-    }
+    await r2.send(new PutObjectCommand({
+      Bucket: r2Bucket,
+      Key: videoKey,
+      Body: videoBuffer,
+      ContentType: 'video/mp4',
+    }));
 
-    const outputPath = path.join(jobDir, 'mixed.mp3');
+    const publicUrl = `${r2PublicUrl.replace(/\/+$/, '')}/${videoKey}`;
+    console.log(`Uploaded: ${publicUrl}`);
 
-    if (musicPath) {
-      await execFileAsync('ffmpeg', [
-        '-y',
-        '-i', voiceoverPath,
-        '-i', musicPath,
-        '-filter_complex',
-        `[1:a]volume=${music_volume}[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[out]`,
-        '-map', '[out]',
-        outputPath,
-      ]);
-    } else {
-      fs.copyFileSync(voiceoverPath, outputPath);
-    }
+    // Cleanup
+    try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch {}
 
-    res.setHeader('Content-Type', 'audio/mpeg');
-    res.setHeader('Content-Disposition', `attachment; filename="mixed-${jobId}.mp3"`);
-
-    const stream = fs.createReadStream(outputPath);
-    stream.pipe(res);
-    stream.on('end', () => cleanup(jobDir));
-    stream.on('error', () => cleanup(jobDir));
+    res.json({ url: publicUrl, filename: `${result.fname}.mp4` });
 
   } catch (err) {
-    console.error(`[${jobId}] Error:`, err.message);
-    cleanup(jobDir);
+    if (jobDir) {
+      try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch {}
+    }
+    console.error('generate-video-url error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
-
-// ── Helpers ──
-
-async function downloadFile(url, destPath) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Download failed (${res.status}): ${url}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  fs.writeFileSync(destPath, buf);
-}
-
-function cleanup(jobDir, extraFiles = []) {
-  try {
-    for (const f of extraFiles) {
-      try { fs.unlinkSync(f); } catch {}
-    }
-    fs.rmSync(jobDir, { recursive: true, force: true });
-  } catch {}
-}
 
 app.listen(PORT, () => {
   console.log(`Osvasa Video Service running on port ${PORT}`);
