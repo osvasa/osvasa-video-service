@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: osvasa-video-service
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+    autoDeploy: true
+    # ffmpeg is pre-installed on Render's native runtime
+    # No additional apt packages needed
