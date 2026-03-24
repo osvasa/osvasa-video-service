@@ -43,7 +43,9 @@ function cleanup(files) {
 
 // ── Core pipeline ──
 
-async function generateVideo({ clipUrls, musicUrl, textOverlays = [], outputFilename }) {
+async function generateVideo({ clipUrls: rawClipUrls, musicUrl, textOverlays = [], outputFilename }) {
+  const clipUrls = rawClipUrls.slice(0, 5);
+  if (rawClipUrls.length > 5) console.log(`Limiting clips from ${rawClipUrls.length} to 5`);
   const jobId = uuidv4().slice(0, 8);
   const jobDir = path.join(TEMP, jobId);
   fs.mkdirSync(jobDir, { recursive: true });
