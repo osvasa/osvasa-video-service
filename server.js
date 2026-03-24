@@ -258,6 +258,9 @@ app.post('/generate-video', async (req, res) => {
 
 // Upload final video to R2 and return public URL
 app.post('/generate-video-url', async (req, res) => {
+  req.setTimeout(0);
+  res.setTimeout(0);
+
   const {
     clipUrls, musicUrl, textOverlays, outputFilename,
     r2Endpoint, r2AccessKey, r2SecretKey, r2Bucket, r2PublicUrl,
@@ -312,6 +315,8 @@ app.post('/generate-video-url', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Osvasa Video Service running on port ${PORT}`);
 });
+server.keepAliveTimeout = 0;
+server.headersTimeout = 0;
