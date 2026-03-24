@@ -10,7 +10,7 @@ const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
 const execFileAsync = promisify(execFile);
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 10000;
 const TEMP = '/tmp/osvasa';
 
 app.use(cors());
